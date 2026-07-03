@@ -1,0 +1,7 @@
+/target
+/data
+/benchmark_data
+*.rs.bk
+.DS_Store
+.idea/
+.vscode/

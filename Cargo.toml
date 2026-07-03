@@ -1,0 +1,55 @@
+[package]
+name = "kvdb-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = []
+license = "MIT/Apache-2.0"
+description = "RocksDB based Redis-compatible KV store in Rust"
+repository = ""
+
+[lib]
+name = "kvdb_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvdb"
+path = "src/main.rs"
+
+[[bin]]
+name = "kvdb-benchmark"
+path = "src/bin/benchmark.rs"
+
+[dependencies]
+rocksdb = "0.24"
+mlua = { version = "0.11", features = ["lua54", "send", "vendored"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+parking_lot = "0.12"
+dashmap = "6"
+axum = "0.8"
+tower = "0.5"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+prometheus = "0.13"
+crc16 = "0.4"
+rand = "0.8"
+itertools = "0.13"
+chrono = "0.4"
+regex = "1"
+sha1 = "0.10"
+sysinfo = "0.37"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
