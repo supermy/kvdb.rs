@@ -32,6 +32,7 @@ fn setup() -> (CommandContext, CommandTable, tempfile::TempDir) {
         lua,
         replication: ReplicationState::new(),
         cluster: ClusterState::new(),
+        namespace: Bytes::new(),
     };
     (ctx, CommandTable::new(), dir)
 }

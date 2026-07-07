@@ -7,12 +7,12 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::cluster::ClusterState;
 use crate::cmd::{ClientState, CommandContext, CommandTable};
 use crate::config::ConfigManager;
-use crate::encoding::metadata_key;
+
 use crate::lua::LuaEngine;
 use crate::protocol::{RespParser, RespSerializer, RespValue};
 use crate::pubsub::PubSubHub;
 use crate::replication::ReplicationState;
-use crate::storage::{CF_METADATA, StorageEngine};
+use crate::storage::StorageEngine;
 use crate::thread_pool::ThreadPool;
 
 /// TCP/RESP 服务器：每个连接独立任务，支持流水线批量解析、Pub/Sub 推送与事务队列。
@@ -66,6 +66,7 @@ impl Server {
             let (pubsub_tx, pubsub_rx) = tokio::sync::mpsc::unbounded_channel();
             let client_id = self.pubsub.alloc_client_id();
             // 每个连接拥有独立的 CommandContext，但共享线程池、命令表与 Pub/Sub 中心。
+            let namespace = Bytes::from(self.config.get().server.namespace);
             let ctx = CommandContext {
                 storage: Arc::clone(&self.storage),
                 config: Arc::clone(&self.config),
@@ -77,6 +78,7 @@ impl Server {
                 lua: Arc::clone(&self.lua),
                 replication: Arc::clone(&self.replication),
                 cluster: Arc::clone(&self.cluster),
+                namespace,
             };
             let table = Arc::clone(&self.table);
             tokio::spawn(async move {
@@ -244,25 +246,25 @@ async fn handle_connection(
 }
 
 /// 对给定用户键列表建立 WATCH 快照：存储 metadata 列族当前值（或 None）。
+/// 使用 get_meta 以兼容旧格式（无 namespace）数据。
 async fn watch_keys(
     ctx: &CommandContext,
     keys: &[Bytes],
 ) -> anyhow::Result<Vec<(Bytes, Option<Vec<u8>>)>> {
-    let storage = Arc::clone(&ctx.storage);
     let keys = keys.to_vec();
-    ctx.tx_pool
-        .spawn(move || {
-            keys.into_iter()
-                .map(|key| {
-                    let meta_key = metadata_key(&key);
-                    let value = storage.get(CF_METADATA, &meta_key)?;
-                    Ok::<_, crate::error::KvdbError>((key, value))
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("watch task aborted: {e}"))?
-        .map_err(|e| anyhow::anyhow!("watch failed: {e}"))
+    let ctx = ctx.clone();
+    let pool = ctx.tx_pool.clone();
+    pool.spawn(move || {
+        keys.into_iter()
+            .map(|key| {
+                let value = ctx.get_meta(&key)?;
+                Ok::<_, crate::error::KvdbError>((key, value))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("watch task aborted: {e}"))?
+    .map_err(|e| anyhow::anyhow!("watch failed: {e}"))
 }
 
 /// 检查 WATCH 快照是否失效：任一被监控键的当前值与快照不一致即返回 true。
@@ -273,22 +275,21 @@ async fn watched_keys_changed(
     if watched.is_empty() {
         return Ok(false);
     }
-    let storage = Arc::clone(&ctx.storage);
     let watched: Vec<(Bytes, Option<Vec<u8>>)> = watched.to_vec();
-    ctx.tx_pool
-        .spawn(move || {
-            for (key, snapshot) in watched {
-                let meta_key = metadata_key(&key);
-                let current = storage.get(CF_METADATA, &meta_key)?;
-                if current != snapshot {
-                    return Ok::<_, crate::error::KvdbError>(true);
-                }
+    let ctx = ctx.clone();
+    let pool = ctx.tx_pool.clone();
+    pool.spawn(move || {
+        for (key, snapshot) in watched {
+            let current = ctx.get_meta(&key)?;
+            if current != snapshot {
+                return Ok::<_, crate::error::KvdbError>(true);
             }
-            Ok(false)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("watch check task aborted: {e}"))?
-        .map_err(|e| anyhow::anyhow!("watch check failed: {e}"))
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("watch check task aborted: {e}"))?
+    .map_err(|e| anyhow::anyhow!("watch check failed: {e}"))
 }
 
 /// 顺序执行事务队列中的命令，返回每条命令的回复。

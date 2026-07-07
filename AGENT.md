@@ -40,7 +40,7 @@
 - [ ] 全量/增量复制同步（Checkpoint + WAL tailing）
 - [ ] 集群槽位迁移与节点间协议
 - [ ] ACL / 配置热更新持久化到磁盘
-- [ ] Stream 完整命令集
+- [x] Stream 核心命令（XADD/XLEN/XRANGE/XREAD）
 - [ ] Sentinel 自动故障转移
 - [ ] Geo / JSON 数据类型
 - [ ] 默认 Web 管理页面（`src/web/`）

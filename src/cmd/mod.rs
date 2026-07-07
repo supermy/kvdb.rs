@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use crate::cluster::ClusterState;
 use crate::config::ConfigManager;
+use crate::encoding::{metadata_key, parse_metadata_key, parse_subkey, subkey};
 use crate::error::{KvdbError, KvdbResult};
 use crate::lua::LuaEngine;
 use crate::protocol::RespValue;
 use crate::pubsub::{PubSubHub, PublishEvent};
 use crate::replication::ReplicationState;
-use crate::storage::StorageEngine;
+use crate::storage::{CF_METADATA, StorageEngine};
 use crate::thread_pool::ThreadPool;
 use tokio::sync::mpsc;
 
@@ -21,6 +22,7 @@ pub mod list;
 pub mod lua;
 pub mod pubsub;
 pub mod set;
+pub mod stream;
 pub mod string;
 pub mod zset;
 
@@ -42,6 +44,47 @@ pub struct CommandContext {
     pub lua: Arc<LuaEngine>,
     pub replication: Arc<ReplicationState>,
     pub cluster: Arc<ClusterState>,
+    /// 全局命名空间前缀，来自 server.namespace 配置；空表示不启用。
+    pub namespace: Bytes,
+}
+
+impl CommandContext {
+    /// 构造当前 namespace 下的 metadata 键。
+    pub fn meta_key(&self, user_key: &[u8]) -> Vec<u8> {
+        metadata_key(user_key, &self.namespace)
+    }
+
+    /// 构造当前 namespace 下的 subkey。
+    pub fn sub_key(&self, user_key: &[u8], version: u64, sub: &[u8]) -> Vec<u8> {
+        subkey(user_key, version, sub, &self.namespace)
+    }
+
+    /// 解析当前 namespace 下的 metadata 键，返回用户原始键。
+    pub fn parse_meta_key<'a>(&'a self, data: &'a [u8]) -> Option<&'a [u8]> {
+        parse_metadata_key(data, &self.namespace)
+    }
+
+    /// 解析当前 namespace 下的 subkey，返回 (user_key, version, sub)。
+    pub fn parse_subkey<'a>(&'a self, data: &'a [u8]) -> Option<(&'a [u8], u64, &'a [u8])> {
+        parse_subkey(data, &self.namespace)
+    }
+
+    /// 读取 metadata 列族，优先使用当前 namespace 键；若未命中且 namespace 非空，
+    /// 则回退到旧格式（无 namespace）以兼容历史数据。
+    pub fn get_meta(&self, user_key: &[u8]) -> KvdbResult<Option<Vec<u8>>> {
+        let key = self.meta_key(user_key);
+        match self.storage.get(CF_METADATA, &key)? {
+            Some(v) => Ok(Some(v)),
+            None => {
+                if self.namespace.is_empty() {
+                    Ok(None)
+                } else {
+                    let legacy = metadata_key(user_key, &[]);
+                    self.storage.get(CF_METADATA, &legacy)
+                }
+            }
+        }
+    }
 }
 
 pub type CommandFn = fn(&CommandContext, &[Bytes]) -> KvdbResult<RespValue>;
@@ -61,6 +104,7 @@ impl CommandTable {
         list::register(&mut table);
         set::register(&mut table);
         zset::register(&mut table);
+        stream::register(&mut table);
         bitmap::register(&mut table);
         pubsub::register(&mut table);
         lua::register(&mut table);

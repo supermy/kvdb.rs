@@ -2,7 +2,7 @@ use bytes::Bytes;
 use rocksdb::WriteBatch;
 
 use super::{CommandContext, CommandTable, expect_arg_count, expect_min_arg_count};
-use crate::encoding::{decode_metadata, encode_metadata, generate_version, metadata_key, subkey};
+use crate::encoding::{decode_metadata, encode_metadata, generate_version};
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
 use crate::storage::{CF_METADATA, CF_SUBKEY};
@@ -27,8 +27,10 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn read_bitmap_meta(ctx: &CommandContext, key: &[u8]) -> KvdbResult<Option<Metadata>> {
-    match ctx.storage.get(CF_META, key)? {
+/// 读取并校验 Bitmap 类型的 metadata；不存在或已过期返回 None，类型错误返回 Err。
+/// 使用 ctx.get_meta 以兼容旧格式（无 namespace）数据。
+fn read_bitmap_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Option<Metadata>> {
+    match ctx.get_meta(user_key)? {
         Some(v) => {
             let meta = decode_metadata(&v)
                 .ok_or(KvdbError::Protocol("invalid metadata encoding".to_string()))?;
@@ -46,8 +48,8 @@ fn read_bitmap_meta(ctx: &CommandContext, key: &[u8]) -> KvdbResult<Option<Metad
     }
 }
 
-fn get_or_create_metadata(ctx: &CommandContext, key: &[u8]) -> KvdbResult<Metadata> {
-    match read_bitmap_meta(ctx, key)? {
+fn get_or_create_metadata(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Metadata> {
+    match read_bitmap_meta(ctx, user_key)? {
         Some(meta) => Ok(meta),
         None => Ok(Metadata::new(DataType::Bitmap, generate_version())),
     }
@@ -59,7 +61,7 @@ fn read_fragment(
     user_key: &[u8],
     index: u64,
 ) -> KvdbResult<Vec<u8>> {
-    let sk = subkey(user_key, meta.version, &index.to_be_bytes());
+    let sk = ctx.sub_key(user_key, meta.version, &index.to_be_bytes());
     match ctx.storage.get(CF_SUB, &sk)? {
         Some(v) => Ok(v),
         None => Ok(Vec::new()),
@@ -111,8 +113,8 @@ fn setbit(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     let offset = parse_offset(&args[1])?;
     let value = parse_bit(&args[2])?;
 
-    let meta_key = metadata_key(user_key);
-    let mut meta = get_or_create_metadata(ctx, &meta_key)?;
+    let meta_key = ctx.meta_key(user_key);
+    let mut meta = get_or_create_metadata(ctx, user_key)?;
 
     let index = offset / FRAGMENT_BITS;
     let frag_off = ((offset % FRAGMENT_BITS) / 8) as usize;
@@ -138,7 +140,7 @@ fn setbit(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     let mut batch = WriteBatch::default();
     ctx.storage
         .batch_put(&mut batch, CF_META, &meta_key, &encode_metadata(&meta))?;
-    let sk = subkey(user_key, meta.version, &index.to_be_bytes());
+    let sk = ctx.sub_key(user_key, meta.version, &index.to_be_bytes());
     ctx.storage.batch_put(&mut batch, CF_SUB, &sk, &frag)?;
     ctx.storage.write(batch)?;
 
@@ -150,8 +152,7 @@ fn getbit(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     let user_key = &args[0];
     let offset = parse_offset(&args[1])?;
 
-    let meta_key = metadata_key(user_key);
-    let meta = match read_bitmap_meta(ctx, &meta_key)? {
+    let meta = match read_bitmap_meta(ctx, user_key)? {
         Some(m) => m,
         None => return Ok(RespValue::Integer(0)),
     };
@@ -179,8 +180,7 @@ fn bitcount(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         (parse_i64(&args[1])?, parse_i64(&args[2])?)
     };
 
-    let meta_key = metadata_key(user_key);
-    let meta = match read_bitmap_meta(ctx, &meta_key)? {
+    let meta = match read_bitmap_meta(ctx, user_key)? {
         Some(m) => m,
         None => return Ok(RespValue::Integer(0)),
     };
@@ -257,8 +257,7 @@ fn bitop(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     let mut src_metas = Vec::with_capacity(src_keys.len());
     let mut max_size: u64 = 0;
     for key in src_keys {
-        let meta_key = metadata_key(key);
-        match read_bitmap_meta(ctx, &meta_key)? {
+        match read_bitmap_meta(ctx, key)? {
             Some(m) => {
                 if m.size > max_size {
                     max_size = m.size;
@@ -269,7 +268,7 @@ fn bitop(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         }
     }
 
-    let dest_meta_key = metadata_key(dest_key);
+    let dest_meta_key = ctx.meta_key(dest_key);
     let dest_version = generate_version();
     let mut dest_meta = Metadata::new(DataType::Bitmap, dest_version);
     dest_meta.size = max_size;
@@ -333,7 +332,7 @@ fn bitop(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
             }
         }
 
-        let sk = subkey(dest_key, dest_version, &frag_idx.to_be_bytes());
+        let sk = ctx.sub_key(dest_key, dest_version, &frag_idx.to_be_bytes());
         ctx.storage.batch_put(&mut batch, CF_SUB, &sk, &result)?;
     }
 

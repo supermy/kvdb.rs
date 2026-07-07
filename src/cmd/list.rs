@@ -2,7 +2,7 @@ use bytes::Bytes;
 use rocksdb::WriteBatch;
 
 use super::{CommandContext, CommandTable, expect_arg_count, expect_min_arg_count};
-use crate::encoding::{decode_metadata, encode_metadata, generate_version, metadata_key, subkey};
+use crate::encoding::{decode_metadata, encode_metadata, generate_version};
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
 use crate::storage::{CF_METADATA, CF_SUBKEY, DataType};
@@ -27,9 +27,10 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// 读取并校验 List 类型的 metadata；不存在或已过期返回 None，类型错误返回 Err。
+/// 使用 ctx.get_meta 以兼容旧格式（无 namespace）数据。
 fn load_list_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Option<Metadata>> {
-    let meta_key = metadata_key(user_key);
-    match ctx.storage.get(CF_METADATA, &meta_key)? {
+    match ctx.get_meta(user_key)? {
         None => Ok(None),
         Some(v) => {
             let dtype = DataType::from_code(v[0] & 0x0F);
@@ -58,7 +59,6 @@ fn push(ctx: &CommandContext, args: &[Bytes], left: bool) -> KvdbResult<RespValu
     expect_min_arg_count(name, args, 2)?;
 
     let user_key = &args[0];
-    let meta_key = metadata_key(user_key);
     let mut meta = match load_list_meta(ctx, user_key)? {
         Some(m) => m,
         None => Metadata::new(DataType::List, generate_version()),
@@ -68,18 +68,18 @@ fn push(ctx: &CommandContext, args: &[Bytes], left: bool) -> KvdbResult<RespValu
     for element in &args[1..] {
         if left {
             meta.head -= 1;
-            let sk = subkey(user_key, meta.version, &meta.head.to_be_bytes());
+            let sk = ctx.sub_key(user_key, meta.version, &meta.head.to_be_bytes());
             batch.put_cf(ctx.storage.cf(CF_SUBKEY)?, &sk, element);
         } else {
             meta.tail += 1;
-            let sk = subkey(user_key, meta.version, &meta.tail.to_be_bytes());
+            let sk = ctx.sub_key(user_key, meta.version, &meta.tail.to_be_bytes());
             batch.put_cf(ctx.storage.cf(CF_SUBKEY)?, &sk, element);
         }
         meta.size += 1;
     }
     batch.put_cf(
         ctx.storage.cf(CF_METADATA)?,
-        &meta_key,
+        ctx.meta_key(user_key),
         encode_metadata(&meta),
     );
     ctx.storage.write(batch)?;
@@ -99,14 +99,13 @@ fn pop(ctx: &CommandContext, args: &[Bytes], left: bool) -> KvdbResult<RespValue
     expect_arg_count(name, args, 1)?;
 
     let user_key = &args[0];
-    let meta_key = metadata_key(user_key);
     let mut meta = match load_list_meta(ctx, user_key)? {
         Some(m) if m.size > 0 => m,
         _ => return Ok(RespValue::BulkString(None)),
     };
 
     let index = if left { meta.head } else { meta.tail };
-    let sk = subkey(user_key, meta.version, &index.to_be_bytes());
+    let sk = ctx.sub_key(user_key, meta.version, &index.to_be_bytes());
     let value = ctx.storage.get(CF_SUBKEY, &sk)?;
 
     let mut batch = WriteBatch::default();
@@ -123,7 +122,7 @@ fn pop(ctx: &CommandContext, args: &[Bytes], left: bool) -> KvdbResult<RespValue
     }
     batch.put_cf(
         ctx.storage.cf(CF_METADATA)?,
-        &meta_key,
+        ctx.meta_key(user_key),
         encode_metadata(&meta),
     );
     ctx.storage.write(batch)?;
@@ -168,7 +167,7 @@ fn lrange(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     let mut result = Vec::with_capacity((e - s + 1) as usize);
     for i in s..=e {
         let idx = meta.head + i;
-        let sk = subkey(user_key, meta.version, &idx.to_be_bytes());
+        let sk = ctx.sub_key(user_key, meta.version, &idx.to_be_bytes());
         let v = ctx.storage.get(CF_SUBKEY, &sk)?;
         result.push(RespValue::BulkString(v.map(Bytes::from)));
     }
@@ -195,7 +194,7 @@ fn lindex(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     }
 
     let idx = meta.head + i;
-    let sk = subkey(user_key, meta.version, &idx.to_be_bytes());
+    let sk = ctx.sub_key(user_key, meta.version, &idx.to_be_bytes());
     let v = ctx.storage.get(CF_SUBKEY, &sk)?;
     Ok(RespValue::BulkString(v.map(Bytes::from)))
 }

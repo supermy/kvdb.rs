@@ -2,9 +2,7 @@ use bytes::Bytes;
 use rocksdb::WriteBatch;
 
 use super::{CommandContext, CommandTable, expect_arg_count, expect_min_arg_count};
-use crate::encoding::{
-    decode_metadata, encode_metadata, generate_version, metadata_key, parse_subkey, subkey,
-};
+use crate::encoding::{decode_metadata, encode_metadata, generate_version};
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
 use crate::storage::{CF_METADATA, CF_SUBKEY};
@@ -26,27 +24,30 @@ fn wrongtype() -> KvdbError {
     KvdbError::Command(WRONGTYPE_MSG.to_string())
 }
 
+/// 读取并校验 Hash 类型的 metadata；不存在或已过期返回 None，类型错误返回 Err。
+/// 使用 ctx.get_meta 以兼容旧格式（无 namespace）数据。
 fn read_hash_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Option<Metadata>> {
-    let key = metadata_key(user_key);
-    match ctx.storage.get(CF_METADATA, &key)? {
-        Some(v) => {
-            if v.is_empty() {
-                return Err(KvdbError::Protocol("empty metadata value".to_string()));
-            }
-            // String 与复合类型共享 metadata 列族，通过 flags 低 4 位区分。
-            let type_code = v[0] & FLAGS_TYPE_MASK;
-            if type_code == DataType::String.code() {
-                return Err(wrongtype());
-            }
-            let meta = decode_metadata(&v)
-                .ok_or(KvdbError::Protocol("invalid metadata encoding".to_string()))?;
-            if meta.data_type() != Some(DataType::Hash) {
-                return Err(wrongtype());
-            }
-            Ok(Some(meta))
-        }
+    match ctx.get_meta(user_key)? {
+        Some(v) => decode_and_check_hash(&v),
         None => Ok(None),
     }
+}
+
+fn decode_and_check_hash(v: &[u8]) -> KvdbResult<Option<Metadata>> {
+    if v.is_empty() {
+        return Err(KvdbError::Protocol("empty metadata value".to_string()));
+    }
+    // String 与复合类型共享 metadata 列族，通过 flags 低 4 位区分。
+    let type_code = v[0] & FLAGS_TYPE_MASK;
+    if type_code == DataType::String.code() {
+        return Err(wrongtype());
+    }
+    let meta =
+        decode_metadata(v).ok_or(KvdbError::Protocol("invalid metadata encoding".to_string()))?;
+    if meta.data_type() != Some(DataType::Hash) {
+        return Err(wrongtype());
+    }
+    Ok(Some(meta))
 }
 
 fn ensure_hash_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Metadata> {
@@ -68,7 +69,7 @@ fn hset(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     for pair in args[1..].chunks_exact(2) {
         let field = &pair[0];
         let value = &pair[1];
-        let sk = subkey(user_key, meta.version, field);
+        let sk = ctx.sub_key(user_key, meta.version, field);
         let existed = ctx.storage.get(CF_SUBKEY, &sk)?.is_some();
         ctx.storage.batch_put(&mut batch, CF_SUBKEY, &sk, value)?;
         if !existed {
@@ -79,7 +80,7 @@ fn hset(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     ctx.storage.batch_put(
         &mut batch,
         CF_METADATA,
-        &metadata_key(user_key),
+        &ctx.meta_key(user_key),
         &encode_metadata(&meta),
     )?;
     ctx.storage.write(batch)?;
@@ -94,7 +95,7 @@ fn hget(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         Some(m) => m,
         None => return Ok(RespValue::BulkString(None)),
     };
-    let sk = subkey(user_key, meta.version, field);
+    let sk = ctx.sub_key(user_key, meta.version, field);
     match ctx.storage.get(CF_SUBKEY, &sk)? {
         Some(v) => Ok(RespValue::BulkString(Some(Bytes::from(v)))),
         None => Ok(RespValue::BulkString(None)),
@@ -115,7 +116,7 @@ fn hmget(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     };
     let mut result = Vec::with_capacity(args.len() - 1);
     for field in &args[1..] {
-        let sk = subkey(user_key, meta.version, field);
+        let sk = ctx.sub_key(user_key, meta.version, field);
         let val = ctx.storage.get(CF_SUBKEY, &sk)?.map(Bytes::from);
         result.push(RespValue::BulkString(val));
     }
@@ -129,12 +130,13 @@ fn hgetall(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         Some(m) => m,
         None => return Ok(RespValue::Array(vec![])),
     };
-    let prefix = subkey(user_key, meta.version, &[]);
+    let prefix = ctx.sub_key(user_key, meta.version, &[]);
     let items = ctx.storage.prefix_scan(CF_SUBKEY, &prefix)?;
     let mut result = Vec::with_capacity(items.len() * 2);
     for (k, v) in items {
-        let (_, _, field) =
-            parse_subkey(&k).ok_or(KvdbError::Protocol("invalid subkey encoding".to_string()))?;
+        let (_, _, field) = ctx
+            .parse_subkey(&k)
+            .ok_or(KvdbError::Protocol("invalid subkey encoding".to_string()))?;
         result.push(RespValue::BulkString(Some(Bytes::copy_from_slice(field))));
         result.push(RespValue::BulkString(Some(Bytes::from(v))));
     }
@@ -151,7 +153,7 @@ fn hdel(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
     let mut batch = WriteBatch::default();
     let mut deleted: i64 = 0;
     for field in &args[1..] {
-        let sk = subkey(user_key, meta.version, field);
+        let sk = ctx.sub_key(user_key, meta.version, field);
         if ctx.storage.get(CF_SUBKEY, &sk)?.is_some() {
             ctx.storage.batch_delete(&mut batch, CF_SUBKEY, &sk)?;
             meta.size = meta.size.saturating_sub(1);
@@ -162,7 +164,7 @@ fn hdel(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         ctx.storage.batch_put(
             &mut batch,
             CF_METADATA,
-            &metadata_key(user_key),
+            &ctx.meta_key(user_key),
             &encode_metadata(&meta),
         )?;
     }
@@ -178,7 +180,7 @@ fn hexists(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         Some(m) => m,
         None => return Ok(RespValue::Integer(0)),
     };
-    let sk = subkey(user_key, meta.version, field);
+    let sk = ctx.sub_key(user_key, meta.version, field);
     Ok(RespValue::Integer(
         if ctx.storage.get(CF_SUBKEY, &sk)?.is_some() {
             1

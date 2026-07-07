@@ -272,6 +272,7 @@ mod tests {
             lua,
             replication: ReplicationState::new(),
             cluster: ClusterState::new(),
+            namespace: bytes::Bytes::new(),
         };
         (ctx, table, dir)
     }

@@ -31,6 +31,9 @@ pub struct ServerConfig {
     pub tcp_keepalive: u64,
     pub timeout: u64,
     pub http_bind: String,
+    /// 全局命名空间前缀，默认空字符串表示不启用；非空时所有键名前增加该前缀，
+    /// 但读取时仍兼容旧格式数据（未带前缀）。
+    pub namespace: String,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +46,7 @@ impl Default for ServerConfig {
             tcp_keepalive: 300,
             timeout: 0,
             http_bind: "127.0.0.1:8080".to_string(),
+            namespace: String::new(),
         }
     }
 }

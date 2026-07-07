@@ -140,6 +140,13 @@ async fn test_set_basic() {
         RespValue::Array(vec![])
     );
 
+    // SDIFF
+    let reply = send_cmd(&mut stream, &["SDIFF", "s", "s2"]).await;
+    assert_eq!(
+        array_to_set(reply),
+        HashSet::from_iter([bytes::Bytes::from_static(b"d"),])
+    );
+
     // 与不存在 key 求并集不变
     let reply = send_cmd(&mut stream, &["SUNION", "s", "noexist"]).await;
     assert_eq!(
@@ -231,6 +238,58 @@ async fn test_set_wrong_type() {
     assert_error(send_cmd(&mut stream, &["SCARD", "str"]).await);
     assert_error(send_cmd(&mut stream, &["SINTER", "str", "s"]).await);
     assert_error(send_cmd(&mut stream, &["SUNION", "str", "s"]).await);
+}
+
+#[tokio::test]
+async fn test_set_ops_chunked() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ConfigManager::new(build_config(&dir)));
+    let storage =
+        Arc::new(StorageEngine::open(&config.get().storage.db_path, &config.get()).unwrap());
+    let server = Server::bind(config, storage).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let total = 3000usize;
+    let mut a_members: Vec<String> = (0..total).map(|i| format!("a{:08}", i)).collect();
+    let mut b_members: Vec<String> = (0..total).map(|i| format!("b{:08}", i)).collect();
+    // 交集：偶数索引
+    let common: Vec<String> = (0..total)
+        .step_by(2)
+        .map(|i| format!("c{:08}", i))
+        .collect();
+    a_members.extend(common.clone());
+    b_members.extend(common.clone());
+
+    let mut a_cmd = vec!["SADD", "A"];
+    let a_refs: Vec<&str> = a_members.iter().map(|s| s.as_str()).collect();
+    a_cmd.extend(a_refs.iter().copied());
+    let reply = send_cmd(&mut stream, &a_cmd).await;
+    assert_eq!(reply, RespValue::Integer((total + common.len()) as i64));
+
+    let mut b_cmd = vec!["SADD", "B"];
+    let b_refs: Vec<&str> = b_members.iter().map(|s| s.as_str()).collect();
+    b_cmd.extend(b_refs.iter().copied());
+    let reply = send_cmd(&mut stream, &b_cmd).await;
+    assert_eq!(reply, RespValue::Integer((total + common.len()) as i64));
+
+    let reply = send_cmd(&mut stream, &["SINTER", "A", "B"]).await;
+    let inter = array_to_set(reply);
+    assert_eq!(inter.len(), common.len());
+    for m in &common {
+        assert!(inter.contains(&bytes::Bytes::copy_from_slice(m.as_bytes())));
+    }
+
+    let reply = send_cmd(&mut stream, &["SDIFF", "A", "B"]).await;
+    let diff = array_to_set(reply);
+    assert_eq!(diff.len(), total);
+
+    let reply = send_cmd(&mut stream, &["SUNION", "A", "B"]).await;
+    let union = array_to_set(reply);
+    assert_eq!(union.len(), 2 * total + common.len());
 }
 
 #[tokio::test]

@@ -10,56 +10,108 @@ pub fn generate_version() -> u64 {
     (now << 16) | (rnd & 0xFFFF)
 }
 
-/// 构造 metadata 列族的键：当前简化设计为 4 字节长度前缀 + 用户原始键。
-/// 未来可扩展 namespace 与 cluster slot 前缀，保持兼容性。
-pub fn metadata_key(user_key: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + user_key.len());
-    buf.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
-    buf.extend_from_slice(user_key);
-    buf
+/// 构造 metadata 列族的键。
+/// namespace 为空时使用旧格式（4 字节长度前缀 + 用户原始键），保持与历史数据兼容；
+/// namespace 非空时使用新格式（1 字节 ns 长度 + namespace + 4 字节 key 长度 + 用户原始键），
+/// 实现多租户键空间隔离。
+pub fn metadata_key(user_key: &[u8], namespace: &[u8]) -> Vec<u8> {
+    if namespace.is_empty() {
+        let mut buf = Vec::with_capacity(4 + user_key.len());
+        buf.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
+        buf.extend_from_slice(user_key);
+        buf
+    } else {
+        let mut buf = Vec::with_capacity(1 + namespace.len() + 4 + user_key.len());
+        buf.push(namespace.len() as u8);
+        buf.extend_from_slice(namespace);
+        buf.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
+        buf.extend_from_slice(user_key);
+        buf
+    }
 }
 
-/// 解析 metadata 键，返回用户原始键。
-pub fn parse_metadata_key(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < 4 {
-        return None;
+/// 解析 metadata 键，返回用户原始键（不含 namespace）。
+/// 根据传入的 namespace 选择解析格式，namespace 为空时解析旧格式。
+pub fn parse_metadata_key<'a>(data: &'a [u8], namespace: &'a [u8]) -> Option<&'a [u8]> {
+    if namespace.is_empty() {
+        if data.len() < 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + len {
+            return None;
+        }
+        Some(&data[4..4 + len])
+    } else {
+        let ns_len = namespace.len();
+        if data.len() < 1 + ns_len + 4 {
+            return None;
+        }
+        if data[0] as usize != ns_len || &data[1..1 + ns_len] != namespace {
+            return None;
+        }
+        let key_start = 1 + ns_len;
+        let key_len = u32::from_be_bytes([
+            data[key_start],
+            data[key_start + 1],
+            data[key_start + 2],
+            data[key_start + 3],
+        ]) as usize;
+        if data.len() < key_start + 4 + key_len {
+            return None;
+        }
+        Some(&data[key_start + 4..key_start + 4 + key_len])
     }
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + len {
-        return None;
-    }
-    Some(&data[4..4 + len])
 }
 
-/// 构造 subkey：metadata_key + version(8) + sub，用于 Hash/List/Set/ZSet/Bitmap 子键。
-pub fn subkey(user_key: &[u8], version: u64, sub: &[u8]) -> Vec<u8> {
-    let mut buf = metadata_key(user_key);
+/// 构造 subkey：metadata_key + version(8) + sub，用于 Hash/List/Set/ZSet/Bitmap/Stream 子键。
+pub fn subkey(user_key: &[u8], version: u64, sub: &[u8], namespace: &[u8]) -> Vec<u8> {
+    let mut buf = metadata_key(user_key, namespace);
     buf.extend_from_slice(&version.to_be_bytes());
     buf.extend_from_slice(sub);
     buf
 }
 
 /// 解析 subkey，返回 (user_key, version, sub)。
-pub fn parse_subkey(data: &[u8]) -> Option<(&[u8], u64, &[u8])> {
-    if data.len() < 4 {
+/// namespace 为空时解析旧格式，否则跳过 namespace 前缀后解析。
+pub fn parse_subkey<'a>(data: &'a [u8], namespace: &'a [u8]) -> Option<(&'a [u8], u64, &'a [u8])> {
+    let ns_len = namespace.len();
+    let key_offset = if namespace.is_empty() {
+        0
+    } else {
+        if data.len() < 1 + ns_len + 4 {
+            return None;
+        }
+        if data[0] as usize != ns_len || &data[1..1 + ns_len] != namespace {
+            return None;
+        }
+        1 + ns_len
+    };
+    if data.len() < key_offset + 4 {
         return None;
     }
-    let key_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + key_len + 8 {
+    let key_len = u32::from_be_bytes([
+        data[key_offset],
+        data[key_offset + 1],
+        data[key_offset + 2],
+        data[key_offset + 3],
+    ]) as usize;
+    if data.len() < key_offset + 4 + key_len + 8 {
         return None;
     }
-    let user_key = &data[4..4 + key_len];
+    let user_key = &data[key_offset + 4..key_offset + 4 + key_len];
+    let version_pos = key_offset + 4 + key_len;
     let version = u64::from_be_bytes([
-        data[4 + key_len],
-        data[4 + key_len + 1],
-        data[4 + key_len + 2],
-        data[4 + key_len + 3],
-        data[4 + key_len + 4],
-        data[4 + key_len + 5],
-        data[4 + key_len + 6],
-        data[4 + key_len + 7],
+        data[version_pos],
+        data[version_pos + 1],
+        data[version_pos + 2],
+        data[version_pos + 3],
+        data[version_pos + 4],
+        data[version_pos + 5],
+        data[version_pos + 6],
+        data[version_pos + 7],
     ]);
-    let sub = &data[4 + key_len + 8..];
+    let sub = &data[version_pos + 8..];
     Some((user_key, version, sub))
 }
 

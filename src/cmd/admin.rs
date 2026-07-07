@@ -39,11 +39,12 @@ fn info(ctx: &CommandContext, _args: &[Bytes]) -> KvdbResult<RespValue> {
         ReplicationRole::Replica { host, port } => format!("slave:{host}:{port}"),
     };
     let info = format!(
-        "# Server\r\nkvdb_version:0.1.0\r\nconfig_file:{}\r\n\r\n# Clients\r\nmaxclients:{}\r\n\r\n# Persistence\r\ndb_path:{}\r\n\r\n# Replication\r\nrole:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\n",
+        "# Server\r\nkvdb_version:0.1.0\r\nconfig_file:{}\r\nnamespace:{}\r\n\r\n# Clients\r\nmaxclients:{}\r\n\r\n# Persistence\r\ndb_path:{}\r\n\r\n# Replication\r\nrole:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\n",
         cfg.config_file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+        cfg.server.namespace,
         cfg.server.maxclients,
         cfg.storage.db_path,
         role_str,
@@ -60,27 +61,37 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// 统计 metadata 列族中未过期的 String 键数量。
-/// 复合类型实现后，应扩展为按 metadata 类型统计所有数据类型。
+/// 统计当前 namespace 下未过期的键数量。
+/// 兼容 String 类型（直接 decode_string）与复合类型（通过 metadata）。
 fn dbsize(ctx: &CommandContext, _args: &[Bytes]) -> KvdbResult<RespValue> {
     let count = ctx
         .storage
         .full_scan(CF)?
         .into_iter()
-        .filter(|(_, v)| {
-            decode_string(v)
-                .map(|(_, expire, _)| expire <= 0 || expire > now_ms())
-                .unwrap_or(false)
+        .filter(|(k, v)| {
+            // 只统计属于当前 namespace 的键
+            ctx.parse_meta_key(k).is_some() && !is_expired_value(v)
         })
         .count() as i64;
     Ok(RespValue::Integer(count))
 }
 
+/// 判断 metadata value 是否已过期；String 类型使用 expire 字段，复合类型由命令自身处理过期。
+fn is_expired_value(v: &[u8]) -> bool {
+    if let Some((_, expire, _)) = decode_string(v) {
+        expire > 0 && expire <= now_ms()
+    } else {
+        false
+    }
+}
+
+/// 清空当前 namespace 下的所有 metadata 键。
 fn flushdb(ctx: &CommandContext, _args: &[Bytes]) -> KvdbResult<RespValue> {
     let keys: Vec<Vec<u8>> = ctx
         .storage
         .full_scan(CF)?
         .into_iter()
+        .filter(|(k, _)| ctx.parse_meta_key(k).is_some())
         .map(|(k, _)| k)
         .collect();
     for key in keys {

@@ -152,6 +152,7 @@ fn run_embedded(config: &BenchmarkConfig) -> anyhow::Result<BenchmarkResult> {
         lua: Arc::new(crate::lua::LuaEngine::new(Arc::clone(&table))?),
         replication: crate::replication::ReplicationState::new(),
         cluster: crate::cluster::ClusterState::new(),
+        namespace: bytes::Bytes::new(),
     };
 
     let config = config.clone();

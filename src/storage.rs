@@ -18,6 +18,8 @@ pub const CF_PUBSUB: &str = "pubsub";
 
 const ALL_CFS: &[&str] = &[CF_DEFAULT, CF_METADATA, CF_SUBKEY, CF_ZSET_SCORE, CF_PUBSUB];
 
+type Page = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
+
 impl DataType {
     /// 返回该数据类型的主列族：String 存 metadata，复合类型 subkey 存对应列族。
     pub const fn cf_name(&self) -> &'static str {
@@ -146,6 +148,47 @@ impl StorageEngine {
         iter.map(|r| r.map(|(k, v)| (k.to_vec(), v.to_vec())))
             .collect::<Result<_, _>>()
             .map_err(KvdbError::from)
+    }
+
+    /// 分页前缀扫描：从 `start_key` 的下一项开始，扫描同一前缀下的最多 `limit` 条记录。
+    /// 当 `start_key` 为空时从首项开始；返回 (条目, 下一页起始 key)，条目不足 limit 时后者为 None。
+    pub fn prefix_scan_page(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        limit: usize,
+    ) -> KvdbResult<Page> {
+        let cf = self.cf(cf)?;
+        let mut iter = self.db.prefix_iterator_cf(cf, prefix);
+        if !start_key.is_empty() {
+            iter.set_mode(rocksdb::IteratorMode::From(
+                start_key,
+                rocksdb::Direction::Forward,
+            ));
+        }
+        let mut result = Vec::with_capacity(limit);
+        let mut last_key = None;
+        let mut first = !start_key.is_empty();
+        for item in iter.by_ref() {
+            let (k, v) = item?;
+            if first {
+                // 跳过 start_key 自身，从下一项开始
+                first = false;
+                if k.as_ref() == start_key {
+                    continue;
+                }
+            }
+            last_key = Some(k.to_vec());
+            result.push((k.to_vec(), v.to_vec()));
+            if result.len() >= limit {
+                break;
+            }
+        }
+        // 预读下一条确认是否结束
+        let has_more = iter.next().transpose()?.is_some();
+        let next_key = if has_more { last_key } else { None };
+        Ok((result, next_key))
     }
 
     pub fn full_scan(&self, cf: &str) -> KvdbResult<Vec<(Vec<u8>, Vec<u8>)>> {

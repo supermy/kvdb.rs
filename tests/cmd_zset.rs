@@ -210,6 +210,99 @@ async fn wrong_type_error() {
 }
 
 #[tokio::test]
+async fn zrevrange_and_withscores() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(
+        &mut stream,
+        &["ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d"],
+    )
+    .await;
+
+    let reply = send_cmd(&mut stream, &["ZREVRANGE", "z", "0", "-1"]).await;
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![bulk("d"), bulk("c"), bulk("b"), bulk("a")])
+    );
+
+    let reply = send_cmd(&mut stream, &["ZREVRANGE", "z", "1", "2"]).await;
+    assert_eq!(reply, RespValue::Array(vec![bulk("c"), bulk("b")]));
+
+    let reply = send_cmd(&mut stream, &["ZREVRANGE", "z", "0", "-1", "WITHSCORES"]).await;
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![
+            bulk("d"),
+            bulk("4"),
+            bulk("c"),
+            bulk("3"),
+            bulk("b"),
+            bulk("2"),
+            bulk("a"),
+            bulk("1"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn zrevrangebyscore() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(
+        &mut stream,
+        &["ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d"],
+    )
+    .await;
+
+    let reply = send_cmd(&mut stream, &["ZREVRANGEBYSCORE", "z", "3", "2"]).await;
+    assert_eq!(reply, RespValue::Array(vec![bulk("c"), bulk("b")]));
+
+    let reply = send_cmd(&mut stream, &["ZREVRANGEBYSCORE", "z", "+inf", "-inf"]).await;
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![bulk("d"), bulk("c"), bulk("b"), bulk("a")])
+    );
+
+    let reply = send_cmd(
+        &mut stream,
+        &["ZREVRANGEBYSCORE", "z", "3.5", "2.5", "WITHSCORES"],
+    )
+    .await;
+    assert_eq!(reply, RespValue::Array(vec![bulk("c"), bulk("3")]));
+}
+
+#[tokio::test]
+async fn zrevrank_and_zincrby() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]).await;
+
+    let reply = send_cmd(&mut stream, &["ZREVRANK", "z", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(1));
+
+    let reply = send_cmd(&mut stream, &["ZREVRANK", "z", "notexist"]).await;
+    assert_eq!(reply, RespValue::BulkString(None));
+
+    // ZINCRBY 对已有 member 增加
+    let reply = send_cmd(&mut stream, &["ZINCRBY", "z", "5", "b"]).await;
+    assert_eq!(reply, bulk("7"));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "b"]).await;
+    assert_eq!(reply, bulk("7"));
+
+    // 增加后 b 成为最高分，反向排名为 0
+    let reply = send_cmd(&mut stream, &["ZREVRANK", "z", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(0));
+
+    // ZINCRBY 对不存在的 member 等价于设置 score
+    let reply = send_cmd(&mut stream, &["ZINCRBY", "z", "10", "d"]).await;
+    assert_eq!(reply, bulk("10"));
+
+    let reply = send_cmd(&mut stream, &["ZCARD", "z"]).await;
+    assert_eq!(reply, RespValue::Integer(4));
+}
+
+#[tokio::test]
 async fn empty_key_returns_zero_or_empty() {
     let (_dir, mut stream) = setup_server().await;
 
@@ -223,6 +316,9 @@ async fn empty_key_returns_zero_or_empty() {
     assert_eq!(reply, RespValue::BulkString(None));
 
     let reply = send_cmd(&mut stream, &["ZRANK", "nonexistent", "m"]).await;
+    assert_eq!(reply, RespValue::BulkString(None));
+
+    let reply = send_cmd(&mut stream, &["ZREVRANK", "nonexistent", "m"]).await;
     assert_eq!(reply, RespValue::BulkString(None));
 
     let reply = send_cmd(&mut stream, &["ZREM", "nonexistent", "m"]).await;
