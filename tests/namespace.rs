@@ -146,3 +146,24 @@ fn namespace_flushdb_isolated() {
         RespValue::BulkString(Some(Bytes::from_static(b"v2")))
     );
 }
+
+#[test]
+fn config_validate_rejects_oversized_namespace() {
+    // namespace 长度存储为单字节（u8），超过 255 字节会静默截断导致键空间错乱。
+    let mut config = Config::default();
+    config.server.namespace = "x".repeat(256);
+    let err = config.validate();
+    assert!(
+        err.is_err(),
+        "namespace > 255 bytes should be rejected, got {:?}",
+        err
+    );
+
+    // 255 字节为合法上限
+    config.server.namespace = "x".repeat(255);
+    assert!(config.validate().is_ok());
+
+    // 空字符串合法
+    config.server.namespace = String::new();
+    assert!(config.validate().is_ok());
+}

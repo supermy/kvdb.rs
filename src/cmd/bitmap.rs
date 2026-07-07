@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use rocksdb::WriteBatch;
 
-use super::{CommandContext, CommandTable, expect_arg_count, expect_min_arg_count};
+use super::{
+    CommandContext, CommandTable, expect_arg_count, expect_min_arg_count, wrong_type_error,
+};
 use crate::encoding::{decode_metadata, encode_metadata, generate_version};
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
@@ -28,16 +30,23 @@ fn now_ms() -> i64 {
 }
 
 /// 读取并校验 Bitmap 类型的 metadata；不存在或已过期返回 None，类型错误返回 Err。
+/// 统一模式：空值检查 → String 类型检查 → decode → 目标类型检查 → 过期检查。
 /// 使用 ctx.get_meta 以兼容旧格式（无 namespace）数据。
 fn read_bitmap_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Option<Metadata>> {
     match ctx.get_meta(user_key)? {
         Some(v) => {
+            if v.is_empty() {
+                return Err(KvdbError::Protocol("empty metadata value".to_string()));
+            }
+            // String 类型使用独立编码，优先判定以避免 decode_metadata 误解析短 payload。
+            let type_code = v[0] & crate::types::FLAGS_TYPE_MASK;
+            if type_code == DataType::String.code() {
+                return Err(wrong_type_error());
+            }
             let meta = decode_metadata(&v)
-                .ok_or(KvdbError::Protocol("invalid metadata encoding".to_string()))?;
+                .ok_or_else(|| KvdbError::Protocol("invalid bitmap metadata".to_string()))?;
             if meta.data_type() != Some(DataType::Bitmap) {
-                return Err(KvdbError::Command(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
-                ));
+                return Err(wrong_type_error());
             }
             if meta.is_expired(now_ms()) {
                 return Ok(None);

@@ -1,12 +1,10 @@
-use super::{CommandContext, CommandTable, expect_min_arg_count};
+use super::{CommandContext, CommandTable, expect_min_arg_count, wrong_type_error};
 use crate::encoding::{decode_metadata, generate_version};
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
 use crate::storage::{CF_METADATA, CF_SUBKEY, DataType};
 use bytes::Bytes;
 use rocksdb::WriteBatch;
-
-const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
 /// Stream 命令分页上限，防止 XRANGE/XREAD 单次返回过大结果导致 OOM。
 const STREAM_PAGE_LIMIT: usize = 1000;
@@ -73,15 +71,23 @@ fn decode_stream_meta(data: &[u8]) -> Option<(u8, i64, u64, u64, u64, u64)> {
 fn read_stream_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Option<StreamMeta>> {
     match ctx.get_meta(user_key)? {
         Some(v) => {
+            // 空值校验：避免后续 v[0] 越界。
+            if v.is_empty() {
+                return Err(KvdbError::Protocol("empty metadata value".to_string()));
+            }
             // String 类型使用独立编码，直接判定为类型错误。
             if DataType::from_code(v[0] & 0x0F) == Some(DataType::String) {
-                return Err(KvdbError::Command(WRONGTYPE.to_string()));
+                return Err(wrong_type_error());
             }
             // 先尝试 Stream 自定义编码；失败则回退到通用 Metadata 编码（兼容未迁移数据）。
             if let Some((flags, expire, version, size, last_ms, last_seq)) = decode_stream_meta(&v)
             {
                 if DataType::from_code(flags & 0x0F) != Some(DataType::Stream) {
-                    return Err(KvdbError::Command(WRONGTYPE.to_string()));
+                    return Err(wrong_type_error());
+                }
+                // 统一在读取层处理过期：过期数据对上层表现为不存在，避免各命令重复判断。
+                if expire > 0 && expire <= now_ms() as i64 {
+                    return Ok(None);
                 }
                 return Ok(Some(StreamMeta {
                     flags,
@@ -96,7 +102,7 @@ fn read_stream_meta(ctx: &CommandContext, user_key: &[u8]) -> KvdbResult<Option<
                 KvdbError::Protocol("invalid stream metadata encoding".to_string())
             })?;
             if meta.data_type() != Some(DataType::Stream) {
-                return Err(KvdbError::Command(WRONGTYPE.to_string()));
+                return Err(wrong_type_error());
             }
             if meta.is_expired(now_ms() as i64) {
                 return Ok(None);
@@ -233,29 +239,33 @@ fn decode_fields(data: &[u8]) -> Option<Vec<(Bytes, Bytes)>> {
 
 /// 生成新的 Entry ID。规则：
 /// - "*"：取当前毫秒，序列号在该毫秒内递增；若毫秒变化则序列号归零。
+///   时钟回退保护：若当前时间 <= last_ms，使用 last_ms 并递增序列号。
 /// - "ms-*"：取指定毫秒，序列号在该毫秒内递增。
+///   若指定毫秒 <= last_ms，使用 last_ms 并递增序列号，保证单调递增。
 fn generate_id(spec: &[u8], meta: &StreamMeta) -> KvdbResult<EntryId> {
     let text = std::str::from_utf8(spec)
         .map_err(|_| KvdbError::Command("invalid stream ID".to_string()))?;
     if text == "*" {
-        let ms = now_ms();
-        let seq = if meta.last_ms == ms {
-            meta.last_seq + 1
+        let now = now_ms();
+        let id = if now > meta.last_ms {
+            EntryId(now, 0)
         } else {
-            0
+            // 时钟回退或同一毫秒：使用 last_ms 递增序列号
+            EntryId(meta.last_ms, meta.last_seq + 1)
         };
-        return Ok(EntryId(ms, seq));
+        return Ok(id);
     }
     if let Some(prefix) = text.strip_suffix("-*") {
         let ms = prefix
             .parse::<u64>()
             .map_err(|_| KvdbError::Command("invalid stream ID".to_string()))?;
-        let seq = if meta.last_ms == ms {
-            meta.last_seq + 1
+        let id = if ms > meta.last_ms {
+            EntryId(ms, 0)
         } else {
-            0
+            // 指定毫秒 <= last_ms：使用 last_ms 递增序列号，保证单调递增
+            EntryId(meta.last_ms, meta.last_seq + 1)
         };
-        return Ok(EntryId(ms, seq));
+        return Ok(id);
     }
     let id =
         EntryId::parse(spec)?.ok_or_else(|| KvdbError::Command("invalid stream ID".to_string()))?;
@@ -516,4 +526,74 @@ fn xread(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
 /// XREAD 的 ID 参数：不支持 "-" / "+"，可为 "0-0" 等具体值。
 fn parse_xread_id(s: &[u8]) -> KvdbResult<EntryId> {
     EntryId::parse(s)?.ok_or_else(|| KvdbError::Command("invalid stream ID".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::ClusterState;
+    use crate::cmd::ClientState;
+    use crate::replication::ReplicationState;
+    use crate::storage::{CF_METADATA, StorageEngine};
+    use crate::{Config, ConfigManager};
+    use std::sync::Arc;
+
+    fn setup_ctx() -> (CommandContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.db_path = dir.path().join("db").to_string_lossy().to_string();
+        let config = Arc::new(ConfigManager::new(config));
+        let storage =
+            Arc::new(StorageEngine::open(&config.get().storage.db_path, &config.get()).unwrap());
+        let table = Arc::new(CommandTable::new());
+        let pubsub = Arc::new(crate::pubsub::PubSubHub::new());
+        let (pubsub_tx, _pubsub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = CommandContext {
+            storage,
+            config,
+            tx_pool: crate::thread_pool::ThreadPool::new(1),
+            client: ClientState::default(),
+            pubsub,
+            pubsub_tx,
+            client_id: 0,
+            lua: Arc::new(crate::lua::LuaEngine::new(Arc::clone(&table)).unwrap()),
+            replication: ReplicationState::new(),
+            cluster: ClusterState::new(),
+            namespace: Bytes::new(),
+        };
+        (ctx, dir)
+    }
+
+    #[test]
+    fn read_stream_meta_returns_none_when_expired() {
+        let (ctx, _dir) = setup_ctx();
+        let meta = StreamMeta::new(generate_version());
+        let mut expired = meta;
+        expired.expire = 1; // 过去的时间戳
+        ctx.storage
+            .put(
+                CF_METADATA,
+                &ctx.meta_key(b"expired_stream"),
+                &expired.encode(),
+            )
+            .unwrap();
+
+        let result = read_stream_meta(&ctx, b"expired_stream").unwrap();
+        assert!(
+            result.is_none(),
+            "expired stream metadata should be treated as absent"
+        );
+    }
+
+    #[test]
+    fn read_stream_meta_returns_some_when_not_expired() {
+        let (ctx, _dir) = setup_ctx();
+        let meta = StreamMeta::new(generate_version());
+        ctx.storage
+            .put(CF_METADATA, &ctx.meta_key(b"live_stream"), &meta.encode())
+            .unwrap();
+
+        let result = read_stream_meta(&ctx, b"live_stream").unwrap();
+        assert!(result.is_some(), "non-expired stream metadata should exist");
+    }
 }

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
     branches: [main, master]
 
@@ -11,15 +12,41 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
+  # 格式检查仅需单平台运行，fmt 结果与平台无关。
+  fmt:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  # 多平台构建与测试矩阵：Ubuntu / macOS / Windows。
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # Windows 需要 MSVC 工具链编译 RocksDB C++ 依赖。
+          - os: windows-latest
+            toolchain: stable-msvc
+          - os: ubuntu-latest
+            toolchain: stable
+          - os: macos-latest
+            toolchain: stable
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -27,18 +54,63 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Check formatting
-        run: cargo fmt -- --check
+      - name: Install RocksDB system dependency (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev clang
 
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --release --bins
 
       - name: Run tests
         run: cargo test --all-targets
 
       - name: Run benchmark smoke
         run: cargo run --bin kvdb-benchmark -- --help || true
+
+      # 上传构建产物，便于发布与分发。
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvdb-${{ runner.os }}-${{ github.sha }}
+          path: |
+            target/release/kvdb
+            target/release/kvdb.exe
+            target/release/kvdb-benchmark
+            target/release/kvdb-benchmark.exe
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Release 任务：仅在 tag 推送时触发，构建并发布多平台产物。
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, build-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.exe
+            artifacts/**/kvdb
+            artifacts/**/kvdb-benchmark

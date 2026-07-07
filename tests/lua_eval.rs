@@ -92,9 +92,10 @@ async fn evalsha_uses_script_cache() {
     let script = "return ARGV[1]";
     let sha1 = sha1_hex(script);
     let reply = send_cmd(&mut stream, &["EVALSHA", &sha1, "0", "hello"]).await;
+    // NOSCRIPT 是 Redis 错误码，不带 "ERR " 前缀。
     assert_eq!(
         reply,
-        RespValue::Error("ERR NOSCRIPT No matching script. Please use EVAL.".to_string())
+        RespValue::Error("NOSCRIPT No matching script. Please use EVAL.".to_string())
     );
 
     let reply = send_cmd(&mut stream, &["EVAL", script, "0", "hello"]).await;

@@ -1,14 +1,16 @@
 use bytes::Bytes;
 use rocksdb::WriteBatch;
 
-use super::{CommandContext, CommandTable, expect_arg_count, expect_min_arg_count};
+use super::{
+    CommandContext, CommandTable, expect_arg_count, expect_min_arg_count, wrong_type_error,
+};
 use crate::encoding::{decode_metadata, encode_metadata, generate_version};
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
 use crate::storage::{CF_METADATA, CF_SUBKEY};
 use crate::types::{DataType, FLAGS_TYPE_MASK, Metadata};
 
-const WRONGTYPE_MSG: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const HASH_PAGE_SIZE: usize = 1024;
 
 pub fn register(table: &mut CommandTable) {
     table.register("HSET", hset);
@@ -18,10 +20,7 @@ pub fn register(table: &mut CommandTable) {
     table.register("HDEL", hdel);
     table.register("HEXISTS", hexists);
     table.register("HLEN", hlen);
-}
-
-fn wrongtype() -> KvdbError {
-    KvdbError::Command(WRONGTYPE_MSG.to_string())
+    table.register("HSCAN", hscan);
 }
 
 /// 读取并校验 Hash 类型的 metadata；不存在或已过期返回 None，类型错误返回 Err。
@@ -40,12 +39,12 @@ fn decode_and_check_hash(v: &[u8]) -> KvdbResult<Option<Metadata>> {
     // String 与复合类型共享 metadata 列族，通过 flags 低 4 位区分。
     let type_code = v[0] & FLAGS_TYPE_MASK;
     if type_code == DataType::String.code() {
-        return Err(wrongtype());
+        return Err(wrong_type_error());
     }
     let meta =
         decode_metadata(v).ok_or(KvdbError::Protocol("invalid metadata encoding".to_string()))?;
     if meta.data_type() != Some(DataType::Hash) {
-        return Err(wrongtype());
+        return Err(wrong_type_error());
     }
     Ok(Some(meta))
 }
@@ -131,14 +130,27 @@ fn hgetall(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         None => return Ok(RespValue::Array(vec![])),
     };
     let prefix = ctx.sub_key(user_key, meta.version, &[]);
-    let items = ctx.storage.prefix_scan(CF_SUBKEY, &prefix)?;
-    let mut result = Vec::with_capacity(items.len() * 2);
-    for (k, v) in items {
-        let (_, _, field) = ctx
-            .parse_subkey(&k)
-            .ok_or(KvdbError::Protocol("invalid subkey encoding".to_string()))?;
-        result.push(RespValue::BulkString(Some(Bytes::copy_from_slice(field))));
-        result.push(RespValue::BulkString(Some(Bytes::from(v))));
+    // 使用分页迭代读取 subkey，避免大 Hash 在读取阶段一次性加载到内存。
+    let mut result = Vec::with_capacity(meta.size as usize * 2);
+    let mut start_key = Vec::new();
+    loop {
+        let (items, next_key) =
+            ctx.storage
+                .prefix_scan_page(CF_SUBKEY, &prefix, &start_key, HASH_PAGE_SIZE)?;
+        if items.is_empty() {
+            break;
+        }
+        for (k, v) in items {
+            let (_, _, field) = ctx
+                .parse_subkey(&k)
+                .ok_or(KvdbError::Protocol("invalid subkey encoding".to_string()))?;
+            result.push(RespValue::BulkString(Some(Bytes::copy_from_slice(field))));
+            result.push(RespValue::BulkString(Some(Bytes::from(v))));
+        }
+        match next_key {
+            Some(k) => start_key = k,
+            None => break,
+        }
     }
     Ok(RespValue::Array(result))
 }
@@ -198,4 +210,78 @@ fn hlen(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
         None => return Ok(RespValue::Integer(0)),
     };
     Ok(RespValue::Integer(meta.size as i64))
+}
+
+fn parse_usize(s: &[u8]) -> KvdbResult<usize> {
+    std::str::from_utf8(s)
+        .map_err(|_| KvdbError::NotInteger)?
+        .parse::<usize>()
+        .map_err(|_| KvdbError::NotInteger)
+}
+
+fn encode_cursor(key: &[u8]) -> String {
+    if key.is_empty() {
+        return "0".to_string();
+    }
+    key.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn decode_cursor(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || s == "0" {
+        return Some(Vec::new());
+    }
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// HSCAN key cursor [COUNT count]
+/// 返回 [next_cursor, [field1, value1, field2, value2, ...]]，cursor 为 "0" 表示遍历结束。
+fn hscan(ctx: &CommandContext, args: &[Bytes]) -> KvdbResult<RespValue> {
+    expect_min_arg_count("HSCAN", args, 2)?;
+    let user_key = &args[0];
+    let cursor_str = std::str::from_utf8(&args[1])
+        .map_err(|_| KvdbError::Command("invalid cursor".to_string()))?;
+    let mut count = 10usize;
+    if args.len() >= 4 && args[2].eq_ignore_ascii_case(b"COUNT") {
+        count = parse_usize(&args[3])?;
+    } else if args.len() > 2 {
+        return Err(KvdbError::Command("syntax error".to_string()));
+    }
+
+    let start_key = decode_cursor(cursor_str)
+        .ok_or_else(|| KvdbError::Command("invalid cursor".to_string()))?;
+
+    let meta = match read_hash_meta(ctx, user_key)? {
+        Some(m) => m,
+        None => {
+            return Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(b"0"))),
+                RespValue::Array(vec![]),
+            ]));
+        }
+    };
+
+    let prefix = ctx.sub_key(user_key, meta.version, &[]);
+    let (items, next_key) = ctx
+        .storage
+        .prefix_scan_page(CF_SUBKEY, &prefix, &start_key, count)?;
+    let mut entries = Vec::with_capacity(items.len() * 2);
+    for (k, v) in items {
+        let (_, _, field) = ctx
+            .parse_subkey(&k)
+            .ok_or(KvdbError::Protocol("invalid subkey encoding".to_string()))?;
+        entries.push(RespValue::BulkString(Some(Bytes::copy_from_slice(field))));
+        entries.push(RespValue::BulkString(Some(Bytes::from(v))));
+    }
+
+    let next_cursor = encode_cursor(&next_key.unwrap_or_default());
+    Ok(RespValue::Array(vec![
+        RespValue::BulkString(Some(Bytes::from(next_cursor))),
+        RespValue::Array(entries),
+    ]))
 }

@@ -5,7 +5,8 @@ RocksDB 驱动的 Redis 兼容键值数据库，使用 Rust 实现，支持 RESP
 ## 特性
 
 - **Redis 协议兼容**：RESP2/RESP3 解析与序列化，支持流水线。
-- **丰富数据结构**：String、Hash、List、Set、ZSet、Bitmap、Stream。
+- **丰富数据结构**：String、Hash、List、Set、ZSet、Bitmap、Stream，全部支持分页扫描避免大集合 OOM。
+- **多租户隔离**：Namespace 前缀编码，DBSIZE / FLUSHDB 按 namespace 隔离，namespace 长度校验 ≤ 255 字节。
 - **事务**：MULTI / EXEC / DISCARD / WATCH，含 WATCH 快照检测。
 - **Lua 脚本**：EVAL / EVALSHA，脚本缓存，`redis.call`/`redis.pcall` 沙箱回调。
 - **Pub/Sub**：SUBSCRIBE / PSUBSCRIBE / PUBLISH / UNSUBSCRIBE。
@@ -14,7 +15,8 @@ RocksDB 驱动的 Redis 兼容键值数据库，使用 Rust 实现，支持 RESP
 - **HTTP 管理接口**：`/health`、`/config`、`/stats`、`/metrics`。
 - **嵌入式 API**：`kvdb_rs::open_embedded`，与 Server 模式共享存储格式。
 - **内置 Benchmark**：`kvdb-benchmark` 支持 embedded/tcp 模式，输出 QPS 与延迟分位点。
-- **八层测试体系**：unit / integration / smoke / regression / acceptance / system / e2e / server。
+- **性能优化**：Bloom filter 加速点查询、分片 key 锁池避免内存泄漏、前缀扫描边界优化。
+- **八层测试体系**：unit / integration / smoke / regression / acceptance / system / e2e / server，104+ 测试用例。
 
 ## 快速开始
 
@@ -89,12 +91,12 @@ dynamic_config = true
 | 类型 | 命令 |
 |------|------|
 | String | GET, SET, MGET, MSET, DEL, EXISTS, INCR, DECR, APPEND |
-| Hash | HGET, HSET, HMGET, HGETALL, HDEL, HLEN, HEXISTS |
+| Hash | HGET, HSET, HMGET, HGETALL, HDEL, HLEN, HEXISTS, HSCAN |
 | List | LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LLEN |
-| Set | SADD, SREM, SISMEMBER, SMEMBERS, SCARD, SPOP |
-| ZSet | ZADD, ZRANGE, ZRANGEBYSCORE, ZREM, ZRANK, ZSCORE, ZCARD |
+| Set | SADD, SREM, SISMEMBER, SMEMBERS, SCARD, SPOP, SINTER, SDIFF, SUNION |
+| ZSet | ZADD (NX/XX/GT/LT/CH/INCR), ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZREM, ZRANK, ZREVRANK, ZSCORE, ZINCRBY, ZCARD |
 | Bitmap | SETBIT, GETBIT, BITCOUNT |
-| Stream | 骨架占位 |
+| Stream | XADD, XLEN, XRANGE, XREAD |
 | Admin | INFO, CONFIG, FLUSHDB, FLUSHALL, PING, ECHO, DBSIZE |
 | Transaction | MULTI, EXEC, DISCARD, WATCH |
 | Lua | EVAL, EVALSHA |
@@ -151,18 +153,29 @@ Errors:       0
 ## 测试
 
 ```bash
-# 全部测试
+# 全部测试（104+ 用例）
 cargo test --all-targets
 
 # 指定测试层
 cargo test --test smoke
 cargo test --test system
 cargo test --test transactions
+cargo test --test storage_perf
 
 # 质量门禁
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+## 性能优化
+
+| 优化项 | 说明 |
+|--------|------|
+| Bloom filter | 10 bits/key, block_based；对不存在的 key 可跳过 SST 磁盘读取 |
+| 分片 key 锁池 | 1024 分片固定大小，替代 per-key DashMap，避免内存泄漏 |
+| 前缀扫描边界 | prefix_scan_page 在前缀边界处提前终止，减少无效 IO |
+| 大集合分页 | Hash/List/Set/ZSet 范围查询全部使用 RocksDB 前缀扫描分页，避免 OOM |
+| 统一 Block Cache | 索引与过滤器块共享 Block Cache 预算，避免内存无界增长 |
 
 ## 生产部署建议
 
@@ -175,12 +188,13 @@ cargo clippy --all-targets -- -D warnings
 
 ## CI/CD
 
-GitHub Actions 工作流位于 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，执行：
+GitHub Actions 工作流位于 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，支持 **Ubuntu / macOS / Windows** 三平台，执行：
 
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo build --bins`
 - `cargo test --all-targets`
+- 跨平台构建产物上传
 
 ## 更新日志
 

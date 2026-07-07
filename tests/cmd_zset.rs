@@ -303,6 +303,128 @@ async fn zrevrank_and_zincrby() {
 }
 
 #[tokio::test]
+async fn zrangebyscore_with_limit() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(
+        &mut stream,
+        &[
+            "ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e",
+        ],
+    )
+    .await;
+
+    // LIMIT offset count
+    let reply = send_cmd(
+        &mut stream,
+        &["ZRANGEBYSCORE", "z", "1", "5", "LIMIT", "1", "2"],
+    )
+    .await;
+    assert_eq!(reply, RespValue::Array(vec![bulk("b"), bulk("c")]));
+
+    // LIMIT 配合 WITHSCORES
+    let reply = send_cmd(
+        &mut stream,
+        &[
+            "ZRANGEBYSCORE",
+            "z",
+            "1",
+            "5",
+            "WITHSCORES",
+            "LIMIT",
+            "2",
+            "2",
+        ],
+    )
+    .await;
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![bulk("c"), bulk("3"), bulk("d"), bulk("4")])
+    );
+
+    // offset 超出范围
+    let reply = send_cmd(
+        &mut stream,
+        &["ZRANGEBYSCORE", "z", "1", "5", "LIMIT", "10", "2"],
+    )
+    .await;
+    assert_eq!(reply, RespValue::Array(vec![]));
+}
+
+#[tokio::test]
+async fn zrevrangebyscore_with_limit() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(
+        &mut stream,
+        &[
+            "ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d", "5", "e",
+        ],
+    )
+    .await;
+
+    let reply = send_cmd(
+        &mut stream,
+        &["ZREVRANGEBYSCORE", "z", "5", "1", "LIMIT", "1", "2"],
+    )
+    .await;
+    assert_eq!(reply, RespValue::Array(vec![bulk("d"), bulk("c")]));
+
+    let reply = send_cmd(
+        &mut stream,
+        &[
+            "ZREVRANGEBYSCORE",
+            "z",
+            "5",
+            "1",
+            "WITHSCORES",
+            "LIMIT",
+            "0",
+            "3",
+        ],
+    )
+    .await;
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![
+            bulk("e"),
+            bulk("5"),
+            bulk("d"),
+            bulk("4"),
+            bulk("c"),
+            bulk("3"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn zrange_does_not_load_whole_set() {
+    let (_dir, mut stream) = setup_server().await;
+
+    // 构造一个包含多个 score 的较大 ZSet，验证只返回指定 rank 范围
+    let mut owned_parts = vec!["ZADD".to_string(), "z".to_string()];
+    for i in 0..50 {
+        owned_parts.push((i + 1).to_string());
+        owned_parts.push(format!("m{:02}", i));
+    }
+    let parts: Vec<&str> = owned_parts.iter().map(|s| s.as_str()).collect();
+    send_cmd(&mut stream, &parts).await;
+
+    let reply = send_cmd(&mut stream, &["ZRANGE", "z", "10", "12"]).await;
+    let mut expected: Vec<RespValue> = Vec::new();
+    for i in 10..=12 {
+        expected.push(bulk(&format!("m{:02}", i)));
+    }
+    assert_eq!(reply, RespValue::Array(expected));
+
+    let reply = send_cmd(&mut stream, &["ZREVRANGE", "z", "0", "2"]).await;
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![bulk("m49"), bulk("m48"), bulk("m47"),])
+    );
+}
+
+#[tokio::test]
 async fn empty_key_returns_zero_or_empty() {
     let (_dir, mut stream) = setup_server().await;
 
@@ -323,4 +445,139 @@ async fn empty_key_returns_zero_or_empty() {
 
     let reply = send_cmd(&mut stream, &["ZREM", "nonexistent", "m"]).await;
     assert_eq!(reply, RespValue::Integer(0));
+}
+
+#[tokio::test]
+async fn zadd_nx_only_add_new() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "1", "a"]).await;
+
+    // NX: 仅新增，已有 member 被跳过
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "NX", "5", "a", "2", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(1));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "a"]).await;
+    assert_eq!(reply, bulk("1"), "NX should not update existing member");
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "b"]).await;
+    assert_eq!(reply, bulk("2"));
+}
+
+#[tokio::test]
+async fn zadd_xx_only_update_existing() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "1", "a"]).await;
+
+    // XX: 仅更新，新 member 被跳过
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "XX", "5", "a", "2", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(0));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "a"]).await;
+    assert_eq!(reply, bulk("5"));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "b"]).await;
+    assert_eq!(reply, RespValue::BulkString(None));
+}
+
+#[tokio::test]
+async fn zadd_gt_only_greater() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "5", "a", "5", "b"]).await;
+
+    // GT: 只更新比当前大的；a=5→10 更新，b=5→3 跳过
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "GT", "10", "a", "3", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(0));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "a"]).await;
+    assert_eq!(reply, bulk("10"));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "b"]).await;
+    assert_eq!(reply, bulk("5"));
+}
+
+#[tokio::test]
+async fn zadd_lt_only_less() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "5", "a", "5", "b"]).await;
+
+    // LT: 只更新比当前小的；a=5→3 更新，b=5→10 跳过
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "LT", "3", "a", "10", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(0));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "a"]).await;
+    assert_eq!(reply, bulk("3"));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "b"]).await;
+    assert_eq!(reply, bulk("5"));
+}
+
+#[tokio::test]
+async fn zadd_ch_returns_changed() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "1", "a"]).await;
+
+    // CH: 返回 changed (added + updated)
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "CH", "5", "a", "2", "b"]).await;
+    assert_eq!(reply, RespValue::Integer(2));
+
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "a"]).await;
+    assert_eq!(reply, bulk("5"));
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "b"]).await;
+    assert_eq!(reply, bulk("2"));
+}
+
+#[tokio::test]
+async fn zadd_incr_mode() {
+    let (_dir, mut stream) = setup_server().await;
+
+    send_cmd(&mut stream, &["ZADD", "z", "5", "a"]).await;
+
+    // INCR: 增量更新，返回新 score
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "INCR", "3", "a"]).await;
+    assert_eq!(reply, bulk("8"));
+
+    // INCR 对不存在的 member 等价于设置 score
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "INCR", "2", "b"]).await;
+    assert_eq!(reply, bulk("2"));
+
+    // INCR + NX 对已有 member 跳过返回 nil
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "INCR", "NX", "1", "a"]).await;
+    assert_eq!(reply, RespValue::BulkString(None));
+
+    // INCR + XX 对不存在 member 返回 nil
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "INCR", "XX", "1", "noexist"]).await;
+    assert_eq!(reply, RespValue::BulkString(None));
+}
+
+#[tokio::test]
+async fn zadd_rejects_invalid_combinations() {
+    let (_dir, mut stream) = setup_server().await;
+
+    // NX 与 XX 互斥
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "NX", "XX", "1", "a"]).await;
+    assert!(matches!(reply, RespValue::Error(_)));
+
+    // GT 与 LT 互斥
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "GT", "LT", "1", "a"]).await;
+    assert!(matches!(reply, RespValue::Error(_)));
+
+    // INCR 只允许单个 score-member
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "INCR", "1", "a", "2", "b"]).await;
+    assert!(matches!(reply, RespValue::Error(_)));
+}
+
+#[tokio::test]
+async fn zadd_gt_adds_new_members() {
+    let (_dir, mut stream) = setup_server().await;
+
+    // GT 可以新增 member（无现有 score 时视为 +inf 才不会插入，但 Redis 中 GT 允许新增）
+    let reply = send_cmd(&mut stream, &["ZADD", "z", "GT", "1", "a"]).await;
+    assert_eq!(reply, RespValue::Integer(1));
+    let reply = send_cmd(&mut stream, &["ZSCORE", "z", "a"]).await;
+    assert_eq!(reply, bulk("1"));
 }

@@ -156,6 +156,13 @@ impl Config {
         if self.server.maxclients <= 0 {
             return Err(KvdbError::Config("maxclients must be > 0".to_string()));
         }
+        // namespace 长度存储为单字节（u8），超过 255 字节会静默截断导致键空间错乱。
+        if self.server.namespace.len() > u8::MAX as usize {
+            return Err(KvdbError::Config(format!(
+                "namespace length {} exceeds u8 max 255; would be silently truncated",
+                self.server.namespace.len()
+            )));
+        }
         Ok(())
     }
 

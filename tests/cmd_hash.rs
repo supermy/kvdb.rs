@@ -4,9 +4,11 @@ use bytes::Bytes;
 
 use kvdb_rs::cluster::ClusterState;
 use kvdb_rs::cmd::{ClientState, CommandContext, CommandTable};
+use kvdb_rs::encoding::decode_metadata;
 use kvdb_rs::protocol::RespValue;
 use kvdb_rs::pubsub::PubSubHub;
 use kvdb_rs::replication::ReplicationState;
+use kvdb_rs::storage::CF_SUBKEY;
 use kvdb_rs::thread_pool::ThreadPool;
 use kvdb_rs::{Config, ConfigManager, StorageEngine};
 
@@ -166,19 +168,123 @@ fn wrongtype_when_key_is_string() {
     let reply = dispatch(&ctx, &table, "SET", &["h", "string-value"]);
     assert_eq!(reply, RespValue::SimpleString("OK".to_string()));
 
+    // WRONGTYPE 错误码不带 "ERR " 前缀，与 Redis 协议一致。
+    let expected = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
     let reply = dispatch(&ctx, &table, "HSET", &["h", "f", "v"]);
-    assert_eq!(
-        reply,
-        RespValue::Error(
-            "ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()
-        )
-    );
+    assert_eq!(reply, RespValue::Error(expected.to_string()));
 
     let reply = dispatch(&ctx, &table, "HGET", &["h", "f"]);
-    assert_eq!(
-        reply,
-        RespValue::Error(
-            "ERR WRONGTYPE Operation against a key holding the wrong kind of value".to_string()
-        )
+    assert_eq!(reply, RespValue::Error(expected.to_string()));
+}
+
+#[test]
+fn hscan_iterates_paginated() {
+    let (ctx, table, _dir) = setup();
+
+    // 写入 5 个 field
+    dispatch(
+        &ctx,
+        &table,
+        "HSET",
+        &["h", "a", "1", "b", "2", "c", "3", "d", "4", "e", "5"],
     );
+
+    let mut cursor = "0".to_string();
+    let mut all: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut iterations = 0usize;
+    loop {
+        iterations += 1;
+        let reply = dispatch(&ctx, &table, "HSCAN", &["h", &cursor, "COUNT", "2"]);
+        let RespValue::Array(arr) = reply else {
+            panic!("expected array, got {:?}", reply);
+        };
+        assert_eq!(arr.len(), 2);
+        let next = match &arr[0] {
+            RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_string(),
+            _ => panic!("expected cursor bulk string"),
+        };
+        let entries = match &arr[1] {
+            RespValue::Array(a) => a,
+            _ => panic!("expected entries array"),
+        };
+        for chunk in entries.chunks_exact(2) {
+            let key = match &chunk[0] {
+                RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_string(),
+                _ => panic!("expected field bulk string"),
+            };
+            let value = match &chunk[1] {
+                RespValue::BulkString(Some(b)) => String::from_utf8_lossy(b).to_string(),
+                _ => panic!("expected value bulk string"),
+            };
+            all.insert(key, value);
+        }
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+        assert!(iterations < 10, "HSCAN did not terminate");
+    }
+
+    assert_eq!(all.len(), 5);
+    assert_eq!(all.get("a"), Some(&"1".to_string()));
+    assert_eq!(all.get("e"), Some(&"5".to_string()));
+}
+
+#[test]
+fn hscan_on_empty_key() {
+    let (ctx, table, _dir) = setup();
+
+    let reply = dispatch(&ctx, &table, "HSCAN", &["empty", "0"]);
+    let RespValue::Array(arr) = reply else {
+        panic!("expected array, got {:?}", reply);
+    };
+    assert_eq!(
+        arr[0],
+        RespValue::BulkString(Some(Bytes::from_static(b"0")))
+    );
+    assert_eq!(arr[1], RespValue::Array(vec![]));
+}
+
+#[test]
+fn hgetall_large_hash() {
+    let (ctx, table, _dir) = setup();
+
+    let mut args = vec!["h"];
+    let mut owned = Vec::new();
+    for i in 0..30 {
+        owned.push(format!("f{:02}", i));
+        owned.push(format!("v{:02}", i));
+    }
+    for s in &owned {
+        args.push(s.as_str());
+    }
+    dispatch(&ctx, &table, "HSET", &args);
+
+    let reply = dispatch(&ctx, &table, "HGETALL", &["h"]);
+    let RespValue::Array(arr) = reply else {
+        panic!("expected array, got {:?}", reply);
+    };
+    assert_eq!(arr.len(), 60);
+}
+
+#[test]
+fn del_clears_hash_subkeys() {
+    let (ctx, table, _dir) = setup();
+
+    dispatch(&ctx, &table, "HSET", &["h", "a", "1", "b", "2", "c", "3"]);
+
+    // 确认 subkey 存在
+    let meta_val = ctx.get_meta(b"h").unwrap().unwrap();
+    let meta = decode_metadata(&meta_val).unwrap();
+    let prefix = ctx.sub_key(b"h", meta.version, &[]);
+    let subkeys = ctx.storage.prefix_scan(CF_SUBKEY, &prefix).unwrap();
+    assert_eq!(subkeys.len(), 3);
+
+    // DEL 应清理 subkey
+    let reply = dispatch(&ctx, &table, "DEL", &["h"]);
+    assert_eq!(reply, RespValue::Integer(1));
+
+    let subkeys = ctx.storage.prefix_scan(CF_SUBKEY, &prefix).unwrap();
+    assert_eq!(subkeys.len(), 0, "DEL must purge all subkeys");
 }

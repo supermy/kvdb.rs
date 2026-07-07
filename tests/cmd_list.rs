@@ -165,6 +165,69 @@ async fn test_pop_until_empty() {
 }
 
 #[tokio::test]
+async fn lpop_rpop_with_count() {
+    let (_dir, mut stream) = start_server().await;
+
+    send_cmd(&mut stream, &["RPUSH", "l", "a", "b", "c", "d", "e"]).await;
+
+    // LPOP with count=2 → ["a", "b"]
+    let reply = send_cmd(&mut stream, &["LPOP", "l", "2"]).await;
+    assert_eq!(reply, array(&["a", "b"]));
+
+    // RPOP with count=2 → ["e", "d"]
+    let reply = send_cmd(&mut stream, &["RPOP", "l", "2"]).await;
+    assert_eq!(reply, array(&["e", "d"]));
+
+    assert_eq!(
+        send_cmd(&mut stream, &["LRANGE", "l", "0", "-1"]).await,
+        array(&["c"])
+    );
+
+    // LPOP count=0 → empty array
+    let reply = send_cmd(&mut stream, &["LPOP", "l", "0"]).await;
+    assert_eq!(reply, RespValue::Array(vec![]));
+
+    // LPOP count exceeding size → returns all remaining
+    let reply = send_cmd(&mut stream, &["LPOP", "l", "10"]).await;
+    assert_eq!(reply, array(&["c"]));
+
+    // LPOP on empty list → empty array
+    let reply = send_cmd(&mut stream, &["LPOP", "l", "3"]).await;
+    assert_eq!(reply, RespValue::Array(vec![]));
+}
+
+#[tokio::test]
+async fn lrange_large_list_paginated() {
+    let (_dir, mut stream) = start_server().await;
+
+    let mut args: Vec<String> = vec!["RPUSH".to_string(), "biglist".to_string()];
+    for i in 0..3000 {
+        args.push(format!("v{}", i));
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        send_cmd(&mut stream, &arg_refs).await,
+        RespValue::Integer(3000)
+    );
+
+    let reply = send_cmd(&mut stream, &["LRANGE", "biglist", "0", "-1"]).await;
+    let RespValue::Array(arr) = reply else {
+        panic!("expected array, got {:?}", reply);
+    };
+    assert_eq!(arr.len(), 3000);
+    assert_eq!(arr[0], bulk("v0"));
+    assert_eq!(arr[2999], bulk("v2999"));
+
+    let reply = send_cmd(&mut stream, &["LRANGE", "biglist", "1000", "2000"]).await;
+    let RespValue::Array(arr) = reply else {
+        panic!("expected array, got {:?}", reply);
+    };
+    assert_eq!(arr.len(), 1001);
+    assert_eq!(arr[0], bulk("v1000"));
+    assert_eq!(arr[1000], bulk("v2000"));
+}
+
+#[tokio::test]
 async fn test_wrong_type() {
     let (_dir, mut stream) = start_server().await;
 

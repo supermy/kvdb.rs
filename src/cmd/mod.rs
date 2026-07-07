@@ -26,6 +26,15 @@ pub mod stream;
 pub mod string;
 pub mod zset;
 
+/// 统一的 WRONGTYPE 错误消息：所有命令在遇到类型不匹配时必须返回该消息，
+/// 保证客户端可凭字符串匹配识别类型错误，与 Redis 协议兼容。
+pub const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+/// 构造 WRONGTYPE 错误，避免各模块重复字面量导致消息漂移。
+pub fn wrong_type_error() -> KvdbError {
+    KvdbError::Command(WRONGTYPE.to_string())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ClientState {
     pub db_index: usize,
@@ -118,16 +127,45 @@ impl CommandTable {
 
     /// 命令分发：执行顺序为解析 → 查表 → 执行 → 返回 RespValue。
     /// 每个命令拥有传入的 Bytes 切片的所有权视图，StorageEngine 负责复制需要持久化的数据。
+    /// 错误格式遵循 Redis 协议：WRONGTYPE 等已知错误码不带 "ERR " 前缀，
+    /// 其他通用错误统一加 "ERR " 前缀。
     pub fn dispatch(&self, ctx: &CommandContext, cmd: &[u8], args: &[Bytes]) -> RespValue {
         let name = String::from_utf8_lossy(cmd).to_ascii_uppercase();
         match self.table.get(&name) {
             Some(func) => match func(ctx, args) {
                 Ok(v) => v,
-                Err(e) => RespValue::Error(format!("ERR {}", e)),
+                Err(e) => RespValue::Error(format_error(e)),
             },
             None => RespValue::Error(format!("ERR unknown command '{}'", name)),
         }
     }
+}
+
+/// 将 KvdbError 格式化为 Redis 协议错误字符串。
+/// 已知 Redis 错误码（WRONGTYPE/NOAUTH/LOADING 等）直接输出，不加 "ERR " 前缀；
+/// 其他错误统一加 "ERR " 前缀，与 Redis 行为一致。
+fn format_error(e: KvdbError) -> String {
+    let msg = e.to_string();
+    // Redis 错误码为全大写单词 + 空格；若消息以此开头则视为已带错误码。
+    if has_redis_error_code(&msg) {
+        msg
+    } else {
+        format!("ERR {}", msg)
+    }
+}
+
+/// 判断消息是否已以 Redis 错误码开头（如 "WRONGTYPE "、"NOAUTH "）。
+/// 规则：首单词全大写字母且长度 ≥ 2，后接空格。
+fn has_redis_error_code(msg: &str) -> bool {
+    let mut upper_count = 0usize;
+    for c in msg.chars() {
+        if c.is_ascii_uppercase() {
+            upper_count += 1;
+        } else {
+            return c == ' ' && upper_count >= 2;
+        }
+    }
+    false
 }
 
 impl Default for CommandTable {

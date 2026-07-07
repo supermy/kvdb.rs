@@ -48,6 +48,17 @@ fn assert_error(value: RespValue) {
     }
 }
 
+fn assert_wrongtype(value: RespValue) {
+    match &value {
+        RespValue::Error(e) => assert!(
+            e.contains("WRONGTYPE"),
+            "expected WRONGTYPE error, got: {}",
+            e
+        ),
+        other => panic!("expected WRONGTYPE error, got {:?}", other),
+    }
+}
+
 #[tokio::test]
 async fn bitmap_commands() {
     let dir = tempfile::tempdir().unwrap();
@@ -204,9 +215,11 @@ async fn bitmap_commands() {
         0,
     );
 
-    // Wrong type: SETBIT on a string key
+    // Wrong type: SETBIT on a string key（短字符串也应返回 WRONGTYPE）
     assert_ok(send_cmd(&mut stream, &["SET", "str", "hello"]).await);
-    assert_error(send_cmd(&mut stream, &["SETBIT", "str", "0", "1"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["SETBIT", "str", "0", "1"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["GETBIT", "str", "0"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["BITCOUNT", "str"]).await);
 
     // Argument errors
     assert_error(send_cmd(&mut stream, &["SETBIT", "x"]).await);

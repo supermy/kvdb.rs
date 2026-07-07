@@ -6,7 +6,40 @@
 
 ### Added
 
-- 新增 `CHANGELOG.md`，记录项目里程碑与关键变更。
+- 新增 Stream 核心命令（`src/cmd/stream.rs`）：XADD（支持 `*` 与 `ms-*` 自动 ID 生成）、XLEN、XRANGE（COUNT 分页）、XREAD（多流 COUNT 轮询），基于 RocksDB 前缀迭代与列族实现。
+- 新增 ZSet 反向命令：ZREVRANGE、ZREVRANK、ZREVRANGEBYSCORE、ZINCRBY。
+- 新增 ZADD 全选项支持：NX / XX / GT / LT / CH / INCR，含互斥校验（NX+XX、GT+LT、NX+GT/LT）与 INCR 单 score-member 限制。
+- 新增 Set 集合运算 SINTER / SDIFF / SUNION，基于 RocksDB 前缀扫描分页实现，避免大集合 OOM。
+- 新增 Namespace 多租户隔离：encoding 层支持 namespace 前缀编码，DBSIZE / FLUSHDB 按 namespace 隔离，namespace 长度校验 ≤ 255 字节。
+- 新增 List LRANGE 分页扫描：encode_index / decode_index 使用符号位翻转的 8 字节大端编码，确保 RocksDB 字典序与 i64 数值序一致，支持负索引。
+- 新增 Hash HGETALL / HSCAN 分页扫描，避免大 Hash OOM。
+- 新增 ZSet ZRANGE / ZRANK 分页扫描，避免大 ZSet OOM。
+- 新增 `tests/cmd_stream.rs`（7 用例）、`tests/namespace.rs`（3 用例）、`tests/cmd_string.rs`、`tests/storage_perf.rs`（8 用例）。
+- 新增 Bloom filter（10 bits/key, block_based）加速点查询，对不存在的 key 可跳过磁盘 IO。
+- 新增分片 key 锁池（1024 分片）替代 DashMap，修复 INCR/DECR/APPEND 路径的内存泄漏。
+
+### Changed
+
+- 统一 WRONGTYPE 错误消息：抽取 `wrong_type_error()` 至 `cmd/mod.rs`，所有数据类型共享同一消息格式。
+- 统一 Redis 错误码协议：WRONGTYPE / NOSCRIPT 等错误码不再添加 "ERR " 前缀，与 Redis 协议一致。
+- Set SINTER / SDIFF / SUNION 改用 RocksDB 前缀扫描分页，替代全量内存加载。
+- prefix_scan / prefix_scan_page / count_prefix 显式 `starts_with(prefix)` 过滤，修复无 prefix_extractor 时跨 namespace 数据泄漏。
+
+### Fixed
+
+- 修复 DEL / EXISTS 仅识别 String 类型的问题，现支持所有数据类型（通过 metadata 检查）。
+- 修复 Stream read_stream_meta 缺少过期检查的问题。
+- 修复 MSET 未使用 WriteBatch 导致非原子的问题。
+- 修复 prefix_iterator_cf 无 prefix_extractor 时不自动截断前缀边界导致跨 namespace 数据泄漏的问题。
+- 修复 namespace 长度 > 255 时 u8 截断导致键空间损坏的问题。
+- 修复 key_locks DashMap 按 key 无限增长导致内存泄漏的问题。
+- 修复 prefix_scan_page 到达前缀边界时仍调用 iter.next() 产生无效 IO 的问题。
+
+### Performance
+
+- Bloom filter 开启后，GET / HGET / ZSCORE 等点查询对不存在的 key 可跳过 SST 文件磁盘读取。
+- 分片 key 锁池内存占用恒定（1024 × Mutex），不随 key 数量增长。
+- prefix_scan_page 反向扫描在前缀边界处提前终止，减少一次无效 IO。
 
 ## [0.1.0] - 2026-07-03
 

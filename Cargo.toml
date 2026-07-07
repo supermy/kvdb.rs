@@ -6,7 +6,7 @@ rust-version = "1.85"
 authors = []
 license = "MIT/Apache-2.0"
 description = "RocksDB based Redis-compatible KV store in Rust"
-repository = ""
+repository = "https://github.com/supermy/kvdb.rs"
 
 [lib]
 name = "kvdb_rs"

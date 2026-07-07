@@ -292,6 +292,41 @@ async fn test_set_ops_chunked() {
     assert_eq!(union.len(), 2 * total + common.len());
 }
 
+fn assert_wrongtype(value: RespValue) {
+    match &value {
+        RespValue::Error(e) => assert!(
+            e.contains("WRONGTYPE"),
+            "expected WRONGTYPE error, got: {}",
+            e
+        ),
+        other => panic!("expected WRONGTYPE error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_set_wrongtype_short_string() {
+    // 短 String 值（payload < 16 字节）也必须返回 WRONGTYPE 而非 Protocol 错误。
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ConfigManager::new(build_config(&dir)));
+    let storage =
+        Arc::new(StorageEngine::open(&config.get().storage.db_path, &config.get()).unwrap());
+    let server = Server::bind(config, storage).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // 短字符串 "v" → String 编码仅 10 字节，远小于 metadata 最小 25 字节
+    send_cmd(&mut stream, &["SET", "str", "v"]).await;
+    assert_wrongtype(send_cmd(&mut stream, &["SADD", "str", "m"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["SISMEMBER", "str", "m"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["SMEMBERS", "str"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["SCARD", "str"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["SINTER", "str"]).await);
+    assert_wrongtype(send_cmd(&mut stream, &["SUNION", "str"]).await);
+}
+
 #[tokio::test]
 async fn test_set_arg_errors() {
     let dir = tempfile::tempdir().unwrap();

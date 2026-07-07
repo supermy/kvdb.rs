@@ -5,9 +5,10 @@ use crate::encoding::decode_string;
 use crate::error::{KvdbError, KvdbResult};
 use crate::protocol::RespValue;
 use crate::replication::ReplicationRole;
-use crate::storage::CF_METADATA;
+use crate::storage::{CF_METADATA, CF_SUBKEY, CF_ZSET_SCORE};
 
 const CF: &str = CF_METADATA;
+const FLUSH_BATCH_SIZE: usize = 1024;
 
 pub fn register(table: &mut CommandTable) {
     table.register("PING", ping);
@@ -61,18 +62,43 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// 构造当前 namespace 的扫描前缀。
+/// namespace 非空时为 [ns_len][namespace]，可匹配 metadata 键与 subkey；
+/// namespace 为空时返回空前缀，扫描全部键（均属于默认 namespace）。
+fn namespace_prefix(ctx: &CommandContext) -> Vec<u8> {
+    if ctx.namespace.is_empty() {
+        Vec::new()
+    } else {
+        let mut p = Vec::with_capacity(1 + ctx.namespace.len());
+        p.push(ctx.namespace.len() as u8);
+        p.extend_from_slice(&ctx.namespace);
+        p
+    }
+}
+
 /// 统计当前 namespace 下未过期的键数量。
-/// 兼容 String 类型（直接 decode_string）与复合类型（通过 metadata）。
+/// 使用分页迭代避免全量加载到内存；兼容 String 与复合类型。
 fn dbsize(ctx: &CommandContext, _args: &[Bytes]) -> KvdbResult<RespValue> {
-    let count = ctx
-        .storage
-        .full_scan(CF)?
-        .into_iter()
-        .filter(|(k, v)| {
-            // 只统计属于当前 namespace 的键
-            ctx.parse_meta_key(k).is_some() && !is_expired_value(v)
-        })
-        .count() as i64;
+    let prefix = namespace_prefix(ctx);
+    let mut count = 0i64;
+    let mut start_key = Vec::new();
+    loop {
+        let (items, next_key) =
+            ctx.storage
+                .prefix_scan_page(CF, &prefix, &start_key, FLUSH_BATCH_SIZE)?;
+        if items.is_empty() {
+            break;
+        }
+        for (_, v) in items {
+            if !is_expired_value(&v) {
+                count += 1;
+            }
+        }
+        match next_key {
+            Some(k) => start_key = k,
+            None => break,
+        }
+    }
     Ok(RespValue::Integer(count))
 }
 
@@ -85,18 +111,16 @@ fn is_expired_value(v: &[u8]) -> bool {
     }
 }
 
-/// 清空当前 namespace 下的所有 metadata 键。
+/// 清空当前 namespace 下的所有数据：metadata + subkey + zset_score。
+/// 使用分页批量删除，避免全量加载到内存。
 fn flushdb(ctx: &CommandContext, _args: &[Bytes]) -> KvdbResult<RespValue> {
-    let keys: Vec<Vec<u8>> = ctx
-        .storage
-        .full_scan(CF)?
-        .into_iter()
-        .filter(|(k, _)| ctx.parse_meta_key(k).is_some())
-        .map(|(k, _)| k)
-        .collect();
-    for key in keys {
-        ctx.storage.delete(CF, &key)?;
-    }
+    let prefix = namespace_prefix(ctx);
+    ctx.storage
+        .delete_prefix(CF_METADATA, &prefix, FLUSH_BATCH_SIZE)?;
+    ctx.storage
+        .delete_prefix(CF_SUBKEY, &prefix, FLUSH_BATCH_SIZE)?;
+    ctx.storage
+        .delete_prefix(CF_ZSET_SCORE, &prefix, FLUSH_BATCH_SIZE)?;
     Ok(RespValue::SimpleString("OK".to_string()))
 }
 
